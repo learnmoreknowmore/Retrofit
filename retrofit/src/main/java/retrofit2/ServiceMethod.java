@@ -22,6 +22,7 @@ import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.net.URI;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -31,7 +32,6 @@ import okhttp3.Headers;
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.MultipartBody;
-import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.ResponseBody;
 import retrofit2.http.Body;
@@ -58,17 +58,18 @@ import retrofit2.http.QueryName;
 import retrofit2.http.Url;
 
 /** Adapts an invocation of an interface method into an HTTP call. */
-final class ServiceMethod<R, T> {
+final class ServiceMethod<ResponseT, ReturnT> {
   // Upper and lower characters, digits, underscores, and hyphens, starting with a character.
   static final String PARAM = "[a-zA-Z][a-zA-Z0-9_-]*";
   static final Pattern PARAM_URL_REGEX = Pattern.compile("\\{(" + PARAM + ")\\}");
   static final Pattern PARAM_NAME_REGEX = Pattern.compile(PARAM);
 
   final okhttp3.Call.Factory callFactory;
-  final CallAdapter<R, T> callAdapter;
+  private final @Nullable CallAdapter<ResponseT, ReturnT> callAdapter;
+  private final @Nullable CallbackAdapter<ResponseT, Object> callbackAdapter;
 
   private final HttpUrl baseUrl;
-  private final Converter<ResponseBody, R> responseConverter;
+  private final Converter<ResponseBody, ResponseT> responseConverter;
   private final String httpMethod;
   private final String relativeUrl;
   private final Headers headers;
@@ -78,9 +79,10 @@ final class ServiceMethod<R, T> {
   private final boolean isMultipart;
   private final ParameterHandler<?>[] parameterHandlers;
 
-  ServiceMethod(Builder<R, T> builder) {
+  ServiceMethod(Builder<ResponseT, ReturnT> builder) {
     this.callFactory = builder.retrofit.callFactory();
     this.callAdapter = builder.callAdapter;
+    this.callbackAdapter = builder.callbackAdapter;
     this.baseUrl = builder.retrofit.baseUrl();
     this.responseConverter = builder.responseConverter;
     this.httpMethod = builder.httpMethod;
@@ -93,8 +95,8 @@ final class ServiceMethod<R, T> {
     this.parameterHandlers = builder.parameterHandlers;
   }
 
-  /** Builds an HTTP request from method arguments. */
-  Request toRequest(@Nullable Object... args) throws IOException {
+  /** Builds an HTTP call from method arguments. */
+  okhttp3.Call toCall(@Nullable Object... args) throws IOException {
     RequestBuilder requestBuilder = new RequestBuilder(httpMethod, baseUrl, relativeUrl, headers,
         contentType, hasBody, isFormEncoded, isMultipart);
 
@@ -111,11 +113,22 @@ final class ServiceMethod<R, T> {
       handlers[p].apply(requestBuilder, args[p]);
     }
 
-    return requestBuilder.build();
+    return callFactory.newCall(requestBuilder.build());
+  }
+
+  ReturnT invoke(Call<ResponseT> call, @Nullable Object[] args) {
+    if (callAdapter != null) {
+      return callAdapter.adapt(call);
+    }
+    if (callbackAdapter != null) {
+      assert args != null; // There wouldn't be a callback adapter if this could happen.
+      return (ReturnT) callbackAdapter.adapt(call, args[args.length - 1]);
+    }
+    throw new AssertionError();
   }
 
   /** Builds a method return value from an HTTP response body. */
-  R toResponse(ResponseBody body) throws IOException {
+  ResponseT toResponse(ResponseBody body) throws IOException {
     return responseConverter.convert(body);
   }
 
@@ -124,7 +137,7 @@ final class ServiceMethod<R, T> {
    * requires potentially-expensive reflection so it is best to build each service method only once
    * and reuse it. Builders cannot be reused.
    */
-  static final class Builder<T, R> {
+  static final class Builder<ResponseT, ReturnT> {
     final Retrofit retrofit;
     final Method method;
     final Annotation[] methodAnnotations;
@@ -147,8 +160,9 @@ final class ServiceMethod<R, T> {
     MediaType contentType;
     Set<String> relativeUrlParamNames;
     ParameterHandler<?>[] parameterHandlers;
-    Converter<ResponseBody, T> responseConverter;
-    CallAdapter<T, R> callAdapter;
+    Converter<ResponseBody, ResponseT> responseConverter;
+    CallAdapter<ResponseT, ReturnT> callAdapter;
+    CallbackAdapter<ResponseT, Object> callbackAdapter;
 
     Builder(Retrofit retrofit, Method method) {
       this.retrofit = retrofit;
@@ -159,15 +173,6 @@ final class ServiceMethod<R, T> {
     }
 
     public ServiceMethod build() {
-      callAdapter = createCallAdapter();
-      responseType = callAdapter.responseType();
-      if (responseType == Response.class || responseType == okhttp3.Response.class) {
-        throw methodError("'"
-            + Utils.getRawType(responseType).getName()
-            + "' is not a valid response body type. Did you mean ResponseBody?");
-      }
-      responseConverter = createResponseConverter();
-
       for (Annotation annotation : methodAnnotations) {
         parseMethodAnnotation(annotation);
       }
@@ -187,23 +192,58 @@ final class ServiceMethod<R, T> {
         }
       }
 
+      Type returnType = method.getGenericReturnType();
+      if (Utils.hasUnresolvableType(returnType)) {
+        throw methodError(
+            "Method return type must not include a type variable or wildcard: %s", returnType);
+      }
+
+      CallbackAdapter<ResponseT, Object> callbackAdapter = null;
+
       int parameterCount = parameterAnnotationsArray.length;
       parameterHandlers = new ParameterHandler<?>[parameterCount];
-      for (int p = 0; p < parameterCount; p++) {
+      for (int p = 0, last = parameterCount - 1; p < parameterCount; p++) {
         Type parameterType = parameterTypes[p];
-        if (Utils.hasUnresolvableType(parameterType)) {
-          throw parameterError(p, "Parameter type must not include a type variable or wildcard: %s",
-              parameterType);
-        }
-
         Annotation[] parameterAnnotations = parameterAnnotationsArray[p];
         if (parameterAnnotations == null) {
           throw parameterError(p, "No Retrofit annotation found.");
         }
 
-        parameterHandlers[p] = parseParameter(p, parameterType, parameterAnnotations);
+        ParameterHandler<?> handler = parseParameter(p, parameterType, parameterAnnotations);
+        if (handler == null) {
+          if (p != last) {
+            throw parameterError(p, "No Retrofit annotation found.");
+          }
+
+          // If we are on the last parameter and no parameter handler was found, check the
+          // callback adapters to see if they can handle the type.
+          callbackAdapter =
+              createCallbackAdapter(p, parameterType, returnType, parameterAnnotations);
+          this.callbackAdapter = callbackAdapter;
+          responseType = callbackAdapter.responseType();
+          handler = ParameterHandler.NO_OP;
+        }
+
+        parameterHandlers[p] = handler;
       }
 
+      if (callbackAdapter == null) {
+        // If we didn't get a callback adapter as part of parameter processing, check the call
+        // adapter factories to find someone to handle the return type.
+        callAdapter = createCallAdapter(returnType);
+        responseType = callAdapter.responseType();
+      }
+
+      if (responseType == Response.class || responseType == okhttp3.Response.class) {
+        throw methodError("'"
+            + Utils.getRawType(responseType).getName()
+            + "' is not a valid response body type. Did you mean ResponseBody?");
+      }
+      responseConverter = createResponseConverter();
+
+      if ("HEAD".equals(httpMethod) && !Void.class.equals(responseType)) {
+        throw methodError("HEAD method must use Void as response type.");
+      }
       if (relativeUrl == null && !gotUrl) {
         throw methodError("Missing either @%s URL or @Url parameter.", httpMethod);
       }
@@ -220,19 +260,40 @@ final class ServiceMethod<R, T> {
       return new ServiceMethod<>(this);
     }
 
-    private CallAdapter<T, R> createCallAdapter() {
-      Type returnType = method.getGenericReturnType();
-      if (Utils.hasUnresolvableType(returnType)) {
-        throw methodError(
-            "Method return type must not include a type variable or wildcard: %s", returnType);
+    private CallbackAdapter<ResponseT, Object> createCallbackAdapter(int index, Type parameterType,
+        Type returnType, Annotation[] parameterAnnotations) {
+      Retrofit retrofit = this.retrofit;
+      List<CallbackAdapter.Factory> factories = retrofit.callbackAdapterFactories;
+      try {
+        for (int i = 0, count = factories.size(); i < count; i++) {
+          CallbackAdapter<?, ?> adapter =
+              factories.get(i).get(parameterType, returnType, parameterAnnotations, retrofit);
+          if (adapter != null) {
+            //noinspection unchecked
+            return (CallbackAdapter<ResponseT, Object>) adapter;
+          }
+        }
+      } catch (RuntimeException e) { // Wide exception range because factories are user code.
+        throw parameterError(e, index, "Unable to create callback adapter for %s", parameterType);
       }
+      StringBuilder builder =
+          new StringBuilder("No Retrofit annotation found nor able to locate callback adapter for ")
+              .append(parameterType)
+              .append(".\n  Tried:");
+      for (CallbackAdapter.Factory factory : factories) {
+        builder.append("\n   * ").append(factory.getClass().getName());
+      }
+      throw parameterError(index, builder.append('\n').toString());
+    }
+
+    private CallAdapter<ResponseT, ReturnT> createCallAdapter(Type returnType) {
       if (returnType == void.class) {
         throw methodError("Service methods cannot return void.");
       }
       Annotation[] annotations = method.getAnnotations();
       try {
         //noinspection unchecked
-        return (CallAdapter<T, R>) retrofit.callAdapter(returnType, annotations);
+        return (CallAdapter<ResponseT, ReturnT>) retrofit.callAdapter(returnType, annotations);
       } catch (RuntimeException e) { // Wide exception range because factories are user code.
         throw methodError(e, "Unable to create call adapter for %s", returnType);
       }
@@ -245,9 +306,6 @@ final class ServiceMethod<R, T> {
         parseHttpMethodAndPath("GET", ((GET) annotation).value(), false);
       } else if (annotation instanceof HEAD) {
         parseHttpMethodAndPath("HEAD", ((HEAD) annotation).value(), false);
-        if (!Void.class.equals(responseType)) {
-          throw methodError("HEAD method must use Void as response type.");
-        }
       } else if (annotation instanceof PATCH) {
         parseHttpMethodAndPath("PATCH", ((PATCH) annotation).value(), true);
       } else if (annotation instanceof POST) {
@@ -329,7 +387,7 @@ final class ServiceMethod<R, T> {
       return builder.build();
     }
 
-    private ParameterHandler<?> parseParameter(
+    private @Nullable ParameterHandler<?> parseParameter(
         int p, Type parameterType, Annotation[] annotations) {
       ParameterHandler<?> result = null;
       for (Annotation annotation : annotations) {
@@ -345,10 +403,6 @@ final class ServiceMethod<R, T> {
         }
 
         result = annotationAction;
-      }
-
-      if (result == null) {
-        throw parameterError(p, "No Retrofit annotation found.");
       }
 
       return result;
@@ -730,7 +784,7 @@ final class ServiceMethod<R, T> {
       }
     }
 
-    private Converter<ResponseBody, T> createResponseConverter() {
+    private Converter<ResponseBody, ResponseT> createResponseConverter() {
       Annotation[] annotations = method.getAnnotations();
       try {
         return retrofit.responseBodyConverter(responseType, annotations);

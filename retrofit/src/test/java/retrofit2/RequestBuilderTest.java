@@ -416,7 +416,7 @@ public final class RequestBuilderTest {
   @Test public void parameterWithoutAnnotation() {
     class Example {
       @GET("/") //
-      Call<ResponseBody> method(String a) {
+      Call<ResponseBody> method(String a, @Query("hey") String hey) {
         return null;
       }
     }
@@ -426,6 +426,26 @@ public final class RequestBuilderTest {
     } catch (IllegalArgumentException e) {
       assertThat(e).hasMessage(
           "No Retrofit annotation found. (parameter #1)\n    for method Example.method");
+    }
+  }
+
+  @Test public void parameterWithoutAnnotationLast() {
+    class Example {
+      @GET("/") //
+      Call<ResponseBody> method(String a) {
+        return null;
+      }
+    }
+    try {
+      buildRequest(Example.class);
+      fail();
+    } catch (IllegalArgumentException e) {
+      assertThat(e).hasMessage(""
+          + "No Retrofit annotation found nor able to locate callback adapter for class java.lang.String.\n"
+          + "  Tried:\n"
+          + "   * retrofit2.DefaultCallbackAdapterFactory\n"
+          + " (parameter #1)\n"
+          + "    for method Example.method");
     }
   }
 
@@ -2684,7 +2704,7 @@ public final class RequestBuilderTest {
     ServiceMethod<T, Call<T>> serviceMethod =
         (ServiceMethod<T, Call<T>>) retrofit.loadServiceMethod(method);
     Call<T> okHttpCall = new OkHttpCall<>(serviceMethod, args);
-    Call<T> call = serviceMethod.callAdapter.adapt(okHttpCall);
+    Call<T> call = serviceMethod.invoke(okHttpCall, args);
     try {
       call.execute();
       throw new AssertionError();

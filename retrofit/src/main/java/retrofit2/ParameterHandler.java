@@ -26,6 +26,11 @@ import okhttp3.RequestBody;
 import static retrofit2.Utils.checkNotNull;
 
 abstract class ParameterHandler<T> {
+  static final ParameterHandler<Object> NO_OP = new ParameterHandler<Object>() {
+    @Override void apply(RequestBuilder builder, @Nullable Object value) {
+    }
+  };
+
   abstract void apply(RequestBuilder builder, @Nullable T value) throws IOException;
 
   final ParameterHandler<Iterable<T>> iterable() {

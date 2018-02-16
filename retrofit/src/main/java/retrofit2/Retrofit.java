@@ -63,17 +63,20 @@ public final class Retrofit {
   final okhttp3.Call.Factory callFactory;
   final HttpUrl baseUrl;
   final List<Converter.Factory> converterFactories;
-  final List<CallAdapter.Factory> adapterFactories;
+  final List<CallAdapter.Factory> callAdapterFactories;
+  final List<CallbackAdapter.Factory> callbackAdapterFactories;
   final @Nullable Executor callbackExecutor;
   final boolean validateEagerly;
 
   Retrofit(okhttp3.Call.Factory callFactory, HttpUrl baseUrl,
-      List<Converter.Factory> converterFactories, List<CallAdapter.Factory> adapterFactories,
-      @Nullable Executor callbackExecutor, boolean validateEagerly) {
+      List<Converter.Factory> converterFactories, List<CallAdapter.Factory> callAdapterFactories,
+      List<CallbackAdapter.Factory> callbackAdapterFactories, @Nullable Executor callbackExecutor,
+      boolean validateEagerly) {
     this.callFactory = callFactory;
     this.baseUrl = baseUrl;
-    this.converterFactories = unmodifiableList(converterFactories); // Defensive copy at call site.
-    this.adapterFactories = unmodifiableList(adapterFactories); // Defensive copy at call site.
+    this.converterFactories = converterFactories; // Copied+unmodifiabled at call site.
+    this.callAdapterFactories = callAdapterFactories; // Copied+unmodifiabled at call site.
+    this.callbackAdapterFactories = callbackAdapterFactories; // Copied+unmodifiabled at call site.
     this.callbackExecutor = callbackExecutor;
     this.validateEagerly = validateEagerly;
   }
@@ -146,7 +149,7 @@ public final class Retrofit {
             ServiceMethod<Object, Object> serviceMethod =
                 (ServiceMethod<Object, Object>) loadServiceMethod(method);
             OkHttpCall<Object> okHttpCall = new OkHttpCall<>(serviceMethod, args);
-            return serviceMethod.callAdapter.adapt(okHttpCall);
+            return serviceMethod.invoke(okHttpCall, args);
           }
         });
   }
@@ -192,14 +195,14 @@ public final class Retrofit {
    * {@linkplain #callAdapter(Type, Annotation[])} call adapter}.
    */
   public List<CallAdapter.Factory> callAdapterFactories() {
-    return adapterFactories;
+    return callAdapterFactories;
   }
 
   /**
    * Returns the {@link CallAdapter} for {@code returnType} from the available {@linkplain
    * #callAdapterFactories() factories}.
    *
-   * @throws IllegalArgumentException if no call adapter available for {@code type}.
+   * @throws IllegalArgumentException if no call adapter is available for the supplied type.
    */
   public CallAdapter<?, ?> callAdapter(Type returnType, Annotation[] annotations) {
     return nextCallAdapter(null, returnType, annotations);
@@ -209,16 +212,16 @@ public final class Retrofit {
    * Returns the {@link CallAdapter} for {@code returnType} from the available {@linkplain
    * #callAdapterFactories() factories} except {@code skipPast}.
    *
-   * @throws IllegalArgumentException if no call adapter available for {@code type}.
+   * @throws IllegalArgumentException if no call adapter is available for the supplied type.
    */
   public CallAdapter<?, ?> nextCallAdapter(@Nullable CallAdapter.Factory skipPast, Type returnType,
       Annotation[] annotations) {
     checkNotNull(returnType, "returnType == null");
     checkNotNull(annotations, "annotations == null");
 
-    int start = adapterFactories.indexOf(skipPast) + 1;
-    for (int i = start, count = adapterFactories.size(); i < count; i++) {
-      CallAdapter<?, ?> adapter = adapterFactories.get(i).get(returnType, annotations, this);
+    int start = callAdapterFactories.indexOf(skipPast) + 1;
+    for (int i = start, count = callAdapterFactories.size(); i < count; i++) {
+      CallAdapter<?, ?> adapter = callAdapterFactories.get(i).get(returnType, annotations, this);
       if (adapter != null) {
         return adapter;
       }
@@ -230,13 +233,70 @@ public final class Retrofit {
     if (skipPast != null) {
       builder.append("  Skipped:");
       for (int i = 0; i < start; i++) {
-        builder.append("\n   * ").append(adapterFactories.get(i).getClass().getName());
+        builder.append("\n   * ").append(callAdapterFactories.get(i).getClass().getName());
       }
       builder.append('\n');
     }
     builder.append("  Tried:");
-    for (int i = start, count = adapterFactories.size(); i < count; i++) {
-      builder.append("\n   * ").append(adapterFactories.get(i).getClass().getName());
+    for (int i = start, count = callAdapterFactories.size(); i < count; i++) {
+      builder.append("\n   * ").append(callAdapterFactories.get(i).getClass().getName());
+    }
+    throw new IllegalArgumentException(builder.toString());
+  }
+
+  /**
+   * Returns a list of the factories tried when creating a
+   * {@linkplain #callbackAdapter(Type, Type, Annotation[])} callback adapter}.
+   */
+  public List<CallbackAdapter.Factory> callbackAdapterFactories() {
+    return callbackAdapterFactories;
+  }
+
+  /**
+   * Returns the {@link CallbackAdapter} for {@code callbackType} and {@code returnType} from the
+   * available {@linkplain #callbackAdapterFactories() factories}.
+   *
+   * @throws IllegalArgumentException if no callback adapter is available for the supplied types.
+   */
+  public CallbackAdapter<?, ?> callbackAdapter(Type callbackType, Type returnType,
+      Annotation[] annotations) {
+    return nextCallbackAdapter(null, callbackType, returnType, annotations);
+  }
+
+  /**
+   * Returns the {@link CallbackAdapter} for {@code callbackType} and {@code returnType} from the
+   * available {@linkplain #callbackAdapterFactories() factories} except {@code skipPast}.
+   *
+   * @throws IllegalArgumentException if no callback adapter is available for the supplied types.
+   */
+  public CallbackAdapter<?, ?> nextCallbackAdapter(@Nullable CallbackAdapter.Factory skipPast,
+      Type callbackType, Type returnType, Annotation[] annotations) {
+    checkNotNull(callbackType, "callbackType == null");
+    checkNotNull(returnType, "returnType == null");
+    checkNotNull(annotations, "annotations == null");
+
+    int start = callbackAdapterFactories.indexOf(skipPast) + 1;
+    for (int i = start, count = callbackAdapterFactories.size(); i < count; i++) {
+      CallbackAdapter<?, ?> adapter =
+          callbackAdapterFactories.get(i).get(callbackType, returnType, annotations, this);
+      if (adapter != null) {
+        return adapter;
+      }
+    }
+
+    StringBuilder builder = new StringBuilder("Could not locate callback adapter for ")
+        .append(returnType)
+        .append(".\n");
+    if (skipPast != null) {
+      builder.append("  Skipped:");
+      for (int i = 0; i < start; i++) {
+        builder.append("\n   * ").append(callbackAdapterFactories.get(i).getClass().getName());
+      }
+      builder.append('\n');
+    }
+    builder.append("  Tried:");
+    for (int i = start, count = callbackAdapterFactories.size(); i < count; i++) {
+      builder.append("\n   * ").append(callbackAdapterFactories.get(i).getClass().getName());
     }
     throw new IllegalArgumentException(builder.toString());
   }
@@ -396,7 +456,8 @@ public final class Retrofit {
     private @Nullable okhttp3.Call.Factory callFactory;
     private HttpUrl baseUrl;
     private final List<Converter.Factory> converterFactories = new ArrayList<>();
-    private final List<CallAdapter.Factory> adapterFactories = new ArrayList<>();
+    private final List<CallAdapter.Factory> callAdapterFactories = new ArrayList<>();
+    private final List<CallbackAdapter.Factory> callbackAdapterFactories = new ArrayList<>();
     private @Nullable Executor callbackExecutor;
     private boolean validateEagerly;
 
@@ -412,12 +473,19 @@ public final class Retrofit {
       platform = Platform.get();
       callFactory = retrofit.callFactory;
       baseUrl = retrofit.baseUrl;
+
       converterFactories.addAll(retrofit.converterFactories);
       // BuiltInConverters instance added by build().
       converterFactories.remove(0);
-      adapterFactories.addAll(retrofit.adapterFactories);
+
+      callAdapterFactories.addAll(retrofit.callAdapterFactories);
       // Remove the default, platform-aware call adapter added by build().
-      adapterFactories.remove(adapterFactories.size() - 1);
+      callAdapterFactories.remove(callAdapterFactories.size() - 1);
+
+      callbackAdapterFactories.addAll(retrofit.callbackAdapterFactories);
+      // Remove the default callback adapter added by build().
+      callbackAdapterFactories.remove(callbackAdapterFactories.size() - 1);
+
       callbackExecutor = retrofit.callbackExecutor;
       validateEagerly = retrofit.validateEagerly;
     }
@@ -526,7 +594,15 @@ public final class Retrofit {
      * Call}.
      */
     public Builder addCallAdapterFactory(CallAdapter.Factory factory) {
-      adapterFactories.add(checkNotNull(factory, "factory == null"));
+      callAdapterFactories.add(checkNotNull(factory, "factory == null"));
+      return this;
+    }
+
+    /**
+     * Add a callback adapter factory for supporting callback parameters in service methodes.
+     */
+    public Builder addCallbackAdapterFactory(CallbackAdapter.Factory factory) {
+      callbackAdapterFactories.add(checkNotNull(factory, "factory == null"));
       return this;
     }
 
@@ -544,7 +620,7 @@ public final class Retrofit {
 
     /** Returns a modifiable list of call adapter factories. */
     public List<CallAdapter.Factory> callAdapterFactories() {
-      return this.adapterFactories;
+      return this.callAdapterFactories;
     }
 
     /** Returns a modifiable list of converter factories. */
@@ -582,9 +658,14 @@ public final class Retrofit {
         callbackExecutor = platform.defaultCallbackExecutor();
       }
 
-      // Make a defensive copy of the adapters and add the default Call adapter.
-      List<CallAdapter.Factory> adapterFactories = new ArrayList<>(this.adapterFactories);
-      adapterFactories.add(platform.defaultCallAdapterFactory(callbackExecutor));
+      // Make a defensive copy of the call adapters and add the default.
+      List<CallAdapter.Factory> callAdapterFactories = new ArrayList<>(this.callAdapterFactories);
+      callAdapterFactories.add(platform.defaultCallAdapterFactory(callbackExecutor));
+
+      // Make a defensive copy of the callback adapters and add the default.
+      List<CallbackAdapter.Factory> callbackAdapterFactories =
+          new ArrayList<>(this.callbackAdapterFactories);
+      callbackAdapterFactories.add(DefaultCallbackAdapterFactory.INSTANCE);
 
       // Make a defensive copy of the converters.
       List<Converter.Factory> converterFactories =
@@ -595,7 +676,8 @@ public final class Retrofit {
       converterFactories.add(new BuiltInConverters());
       converterFactories.addAll(this.converterFactories);
 
-      return new Retrofit(callFactory, baseUrl, converterFactories, adapterFactories,
+      return new Retrofit(callFactory, baseUrl, unmodifiableList(converterFactories),
+          unmodifiableList(callAdapterFactories), unmodifiableList(callbackAdapterFactories),
           callbackExecutor, validateEagerly);
     }
   }
